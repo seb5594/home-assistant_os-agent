@@ -1,0 +1,62 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Merge upstream changes
+    if: github.event.repository.fork
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+    steps:
+      - name: Resolve upstream repository
+        id: upstream
+        run: |
+          repo_info=$(gh api "repos/${GITHUB_REPOSITORY}")
+          echo "repository=$(jq -r '.parent.full_name' <<< "${repo_info}")" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r '.default_branch' <<< "${repo_info}")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.upstream.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream
+        id: merge
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.repository }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          git config user.name "${GITHUB_REPOSITORY_OWNER}"
+          git config user.email "${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --quiet --tags --force upstream "${BRANCH}"
+
+          if git merge --ff-only "upstream/${BRANCH}" || git merge --no-edit "upstream/${BRANCH}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            git push origin "HEAD:${BRANCH}" --tags
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report merge conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.repository }}
+        run: |
+          gh label create sync-conflict --color B60205 --description "Upstream merge needs manual work" 2>/dev/null || true
+          if [ -z "$(gh issue list --label sync-conflict --state open --json number --jq '.[].number')" ]; then
+            gh issue create --label sync-conflict \
+              --title "Merge conflict with ${UPSTREAM}" \
+              --body "The scheduled sync could not merge \`${UPSTREAM}\` automatically. Merge it locally and resolve the conflicts."
+          fi
